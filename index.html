@@ -3737,7 +3737,7 @@
         </div>
 
         <iframe id="cinesrcIframe" 
-                
+                sandbox="allow-scripts allow-same-origin allow-forms allow-presentation"
                 allowfullscreen="true" 
                 webkitallowfullscreen="true" 
                 playsinline="true" 
@@ -3982,26 +3982,32 @@
     const TMDB_BASE = "https://api.themoviedb.org/3";
     const IMG_BASE_W500 = "https://image.tmdb.org/t/p/w500";
     const IMG_BASE_ORIGINAL = "https://image.tmdb.org/t/p/original";
-    // Safe Storage Engine for iOS Quick Look, Sandboxed Viewers & Private Mode
+    // Safe Storage Engine for LocalStorage Persistence & Sandboxed Fallbacks
     const safeStorage = {
       _mem: {},
       getItem(key) {
         try {
-          return window.safeStorage.getItem(key);
-        } catch (e) {
-          return this._mem[key] !== undefined ? this._mem[key] : null;
-        }
+          if (typeof window !== 'undefined' && window.localStorage) {
+            const val = window.localStorage.getItem(key);
+            if (val !== null) return val;
+          }
+        } catch (e) {}
+        return this._mem[key] !== undefined ? this._mem[key] : null;
       },
       setItem(key, val) {
+        const strVal = String(val);
         try {
-          window.safeStorage.setItem(key, String(val));
-        } catch (e) {
-          this._mem[key] = String(val);
-        }
+          if (typeof window !== 'undefined' && window.localStorage) {
+            window.localStorage.setItem(key, strVal);
+          }
+        } catch (e) {}
+        this._mem[key] = strVal;
       },
       removeItem(key) {
         try {
-          window.safeStorage.removeItem(key);
+          if (typeof window !== 'undefined' && window.localStorage) {
+            window.localStorage.removeItem(key);
+          }
         } catch (e) {}
         delete this._mem[key];
       }
@@ -4903,9 +4909,8 @@
       if (loaderTitle) loaderTitle.textContent = `Connecting to ${getServerName(serverName)}...`;
       showPlayerLoader();
 
-      const iframe = ensureCleanPlayerIframe();
       const url = buildStreamUrl(currentStreamingItem, serverName);
-      applyAdShieldToIframe(serverName);
+      const iframe = applyAdShieldToIframe(serverName);
       if (iframe) iframe.src = url;
       showToast(`Switched to ${getServerName(serverName)}`);
     }
@@ -4981,8 +4986,7 @@
       }
 
       const streamUrl = buildStreamUrl(currentStreamingItem, currentServer);
-      const iframe = ensureCleanPlayerIframe();
-      applyAdShieldToIframe(currentServer);
+      const iframe = applyAdShieldToIframe(currentServer);
       if (iframe) iframe.src = streamUrl;
 
       // Update Popout Link & My List button
@@ -5429,25 +5433,30 @@
     }
 
     function addToHistory(item) {
+      if (!item || !item.id) return;
       let list = getHistory();
-      list = list.filter(i => i.id !== item.id);
+      list = list.filter(i => String(i.id) !== String(item.id));
       list.unshift({
         id: item.id,
-        type: item.type,
+        type: item.type || 'movie',
         title: item.title,
         poster: item.poster,
-        year: item.year,
-        imdbRating: item.imdbRating,
+        backdrop: item.backdrop || item.poster,
+        year: item.year || '2024',
+        imdbRating: item.imdbRating || '7.8',
         season: item.season || 1,
         episode: item.episode || 1,
+        overview: item.overview || '',
+        genres: item.genres || '',
         time: Date.now()
       });
       if (list.length > 20) list = list.slice(0, 20);
       safeStorage.setItem(HISTORY_KEY, JSON.stringify(list));
+      renderContinueWatching();
     }
 
     function removeFromHistory(id) {
-      let list = getHistory().filter(i => i.id !== id);
+      let list = getHistory().filter(i => String(i.id) !== String(id));
       safeStorage.setItem(HISTORY_KEY, JSON.stringify(list));
       renderContinueWatching();
     }
@@ -5487,8 +5496,8 @@
     function toggleMyList(item) {
       let list = getMyList();
       const idStr = String(item.id);
-      if (list.some(i => i.id === idStr)) {
-        list = list.filter(i => i.id !== idStr);
+      if (list.some(i => String(i.id) === idStr)) {
+        list = list.filter(i => String(i.id) !== idStr);
       } else {
         list.unshift(item);
       }
@@ -5663,12 +5672,16 @@
       } catch {}
     }
 
-    // Smart Parent Ad & Pop-up Shield (Zero-Sandbox Architecture)
-    // Note: 100% of modern streaming embed providers (VidSrc, AutoEmbed, 2Embed, MultiEmbed, Vidplay)
-    // explicitly detect <iframe sandbox> and refuse playback with "cannot be loaded inside a sandboxed frame".
-    // Therefore, cinesrcIframe MUST NEVER have a sandbox attribute. Instead, we protect the user
-    // via high-performance parent window popup interception and navigation guard.
+    // Smart Server-Aware Ad & Pop-up Shield
+    // CineSrc (Server 1) supports native browser sandbox ("allow-scripts allow-same-origin allow-forms allow-presentation")
+    // which completely prevents rogue popups, popunders, and ad redirects when clicking play.
+    // External secondary servers (VidSrc, MultiEmbed, AutoEmbed) refuse sandboxing and require direct streaming.
+    // Our smart shield automatically activates full sandbox protection on CineSrc, and smoothly pauses it on external servers.
     
+    function doesServerSupportSandbox(server = currentServer) {
+      return server === 'cinesrc';
+    }
+
     let isUserDirectAction = false;
     function flagUserAction() {
       isUserDirectAction = true;
@@ -5689,10 +5702,23 @@
     };
 
     function ensureCleanPlayerIframe() {
+      return applyAdShieldToIframe(currentServer);
+    }
+
+    function applyAdShieldToIframe(serverName = currentServer) {
+      const shieldLabel = document.getElementById('playerShieldLabel');
+      const shieldBtn = document.getElementById('playerShieldBtn');
       let iframe = document.getElementById('cinesrcIframe');
       if (!iframe) return null;
-      if (iframe.hasAttribute('sandbox')) {
-        iframe.removeAttribute('sandbox');
+
+      const isShieldOn = settings.adShield !== false;
+      const supportsSandbox = doesServerSupportSandbox(serverName);
+      const shouldSandbox = isShieldOn && supportsSandbox;
+
+      const currentHasSandbox = iframe.hasAttribute('sandbox');
+
+      // Recreate iframe cleanly only when sandbox mode changes so browser engine applies updated security rules
+      if (currentHasSandbox !== shouldSandbox) {
         const cleanIframe = document.createElement('iframe');
         cleanIframe.id = 'cinesrcIframe';
         cleanIframe.allowFullscreen = true;
@@ -5704,45 +5730,54 @@
         cleanIframe.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture; encrypted-media; accelerometer; gyroscope');
         cleanIframe.setAttribute('referrerpolicy', 'origin');
         cleanIframe.onload = handlePlayerIframeLoaded;
+
+        if (shouldSandbox) {
+          cleanIframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-presentation');
+        }
+
         iframe.replaceWith(cleanIframe);
-        return cleanIframe;
-      }
-      return iframe;
-    }
-
-    function applyAdShieldToIframe(serverName = currentServer) {
-      const shieldLabel = document.getElementById('playerShieldLabel');
-      const shieldBtn = document.getElementById('playerShieldBtn');
-      const iframe = ensureCleanPlayerIframe();
-
-      if (iframe && iframe.hasAttribute('sandbox')) {
-        iframe.removeAttribute('sandbox');
+        iframe = cleanIframe;
       }
 
-      const isShieldOn = settings.adShield !== false;
       if (shieldLabel) {
-        shieldLabel.textContent = isShieldOn ? 'Shield: ON' : 'Shield: OFF';
-      }
-      if (shieldBtn) {
-        if (isShieldOn) {
-          shieldBtn.classList.add('player-shield-active');
-          shieldBtn.title = 'Smart Ad Shield is ACTIVE (Pop-ups blocked without breaking video player)';
+        if (!supportsSandbox) {
+          shieldLabel.textContent = 'Shield: Direct';
         } else {
-          shieldBtn.classList.remove('player-shield-active');
-          shieldBtn.title = 'Smart Ad Shield is PAUSED. Click to enable.';
+          shieldLabel.textContent = shouldSandbox ? 'Shield: ON (Ad-Free)' : 'Shield: OFF';
         }
       }
+
+      if (shieldBtn) {
+        if (shouldSandbox) {
+          shieldBtn.classList.add('player-shield-active');
+          shieldBtn.classList.remove('player-shield-inactive');
+          shieldBtn.title = 'Ad & Pop-up Shield is ON (Zero Ads: Popups & Redirects Blocked)';
+        } else if (!supportsSandbox) {
+          shieldBtn.classList.add('player-shield-active');
+          shieldBtn.classList.remove('player-shield-inactive');
+          shieldBtn.title = `${getServerName(serverName)} streams directly without sandbox`;
+        } else {
+          shieldBtn.classList.remove('player-shield-active');
+          shieldBtn.classList.add('player-shield-inactive');
+          shieldBtn.title = 'Ad Shield is OFF. Click to enable.';
+        }
+      }
+
+      return iframe;
     }
 
     function togglePlayerAdShield() {
       settings.adShield = !settings.adShield;
       safeStorage.setItem('hw_player_settings', JSON.stringify(settings));
-      applyAdShieldToIframe(currentServer);
+      const iframe = applyAdShieldToIframe(currentServer);
+      if (iframe && currentStreamingItem) {
+        iframe.src = buildStreamUrl(currentStreamingItem, currentServer);
+      }
 
       if (settings.adShield) {
-        showToast('🛡️ Smart Ad Shield: ON (Pop-ups blocked)');
+        showToast('🛡️ Ad Shield: ON (CineSrc ads & popups blocked)');
       } else {
-        showToast('Smart Ad Shield: OFF');
+        showToast('Ad Shield: OFF (Popups allowed)');
       }
     }
 
